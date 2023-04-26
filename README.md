@@ -1,8 +1,11 @@
 <h1 align="center">GPT4All</h1>
-<p align="center">Demo, data, and code to train an assistant-style large language model with ~800k GPT-3.5-Turbo Generations based on LLaMa</p>
+<p align="center">Demo, data, and code to train open-source assistant-style large language model based on GPT-J and LLaMa</p>
+<p align="center">
+<a href="https://static.nomic.ai/gpt4all/2023_GPT4All-J_Technical_Report_2.pdf">:green_book: Technical Report 2: GPT4All-J </a>
+</p>
 
 <p align="center">
-<a href="https://s3.amazonaws.com/static.nomic.ai/gpt4all/2023_GPT4All_Technical_Report.pdf">:green_book: Technical Report</a>
+<a href="https://s3.amazonaws.com/static.nomic.ai/gpt4all/2023_GPT4All_Technical_Report.pdf">:green_book: Technical Report 1: GPT4All</a>
 </p>
 
 <p align="center">
@@ -14,7 +17,11 @@
 </p>
 
 <p align="center">
-<a href="https://github.com/nomic-ai/gpt4all-ui">:speech_balloon: Official Chat Interface</a>
+<a href="https://github.com/nomic-ai/gpt4all-ui">:speech_balloon: Official Web Chat Interface</a>
+</p>
+
+<p align="center">
+<a href="https://github.com/nomic-ai/gpt4all-chat">:speech_balloon: Official Chat Interface</a>
 </p>
 
 <p align="center">
@@ -27,6 +34,84 @@
 </p>
 
 
+
+
+<p align="center">
+GPT4All is made possible by our compute partner <a href="https://www.paperspace.com/">Paperspace</a>.
+</p>
+
+
+
+## GPT4All-J: An Apache-2 Licensed GPT4All Model
+![gpt4all-j-demo](https://user-images.githubusercontent.com/13879686/231876409-e3de1934-93bb-4b4b-9013-b491a969ebbc.gif)
+
+Run on an M1 Mac (not sped up!)
+
+
+### GPT4All-J Chat UI Installers
+Installs a native chat-client with auto-update functionality that runs on your desktop with the GPT4All-J model baked into it.
+
+[Mac/OSX](https://gpt4all.io/installers/gpt4all-installer-darwin.dmg)
+
+[Windows](https://gpt4all.io/installers/gpt4all-installer-win64.exe)
+
+[Ubuntu](https://gpt4all.io/installers/gpt4all-installer-linux.run)
+
+If you have older hardware that only supports avx and not avx2 you can use these.
+
+[Mac/OSX - avx-only](https://gpt4all.io/installers/gpt4all-installer-darwin-avx-only.dmg)
+
+[Windows - avx-only](https://gpt4all.io/installers/gpt4all-installer-win64-avx-only.exe)
+
+[Ubuntu - avx-only](https://gpt4all.io/installers/gpt4all-installer-linux-avx-only.run)
+
+These files are not yet cert signed by Windows/Apple so you will see security warnings on initial installation. We did not want to delay release while waiting for their process to complete.
+
+Find the most up-to-date information on the [GPT4All Website](https://gpt4all.io/)
+
+### Raw Model
+[ggml Model Download Link](https://gpt4all.io/models/ggml-gpt4all-j.bin)
+
+Note this model is only compatible with the C++ bindings found [here](https://github.com/nomic-ai/gpt4all-chat). It will not work with any existing llama.cpp bindings as we had to do a large fork of llama.cpp. GPT4All will support the ecosystem around this new C++ backend going forward.
+
+Python bindings are imminent and will be integrated into this [repository](https://github.com/nomic-ai/pyllamacpp). Stay tuned on the [GPT4All discord](https://discord.gg/mGZE39AS3e) for updates.
+
+## Training GPT4All-J
+
+Please see [GPT4All-J Technical Report](https://static.nomic.ai/gpt4all/2023_GPT4All-J_Technical_Report_2.pdf) for details.
+
+### GPT4All-J Training Data
+
+- We are releasing the curated training data for anyone to replicate GPT4All-J here: [GPT4All-J Training Data](https://huggingface.co/datasets/nomic-ai/gpt4all-j-prompt-generations)
+   - [Atlas Map of Prompts](https://atlas.nomic.ai/map/gpt4all-j-prompts-curated)
+   - [Atlas Map of Responses](https://atlas.nomic.ai/map/gpt4all-j-response-curated)
+   
+We have released updated versions of our `GPT4All-J` model and training data. 
+
+- `v1.0`: The original model trained on the v1.0 dataset
+- `v1.1-breezy`: Trained on afiltered dataset where we removed all instances of AI language model
+- `v1.2-jazzy`: Trained on a filtered dataset where we also removed instances like I'm sorry, I can't answer... and AI language model
+
+The [models](https://huggingface.co/nomic-ai/gpt4all-j) and [data](https://huggingface.co/datasets/nomic-ai/gpt4all-j-prompt-generations) versions can be specified by passing a `revision` argument.
+
+For example, to load the `v1.2-jazzy` model and dataset, run:
+
+```python
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+dataset = load_dataset("nomic-ai/gpt4all-j-prompt-generations", revision="v1.2-jazzy")
+model = AutoModelForCausalLM.from_pretrained("nomic-ai/gpt4all-j-prompt-generations", revision="v1.2-jazzy")
+```
+
+### GPT4All-J Training Instructions
+
+```bash
+accelerate launch --dynamo_backend=inductor --num_processes=8 --num_machines=1 --machine_rank=0 --deepspeed_multinode_launcher standard --mixed_precision=bf16  --use_deepspeed --deepspeed_config_file=configs/deepspeed/ds_config_gptj.json train.py --config configs/train/finetune_gptj.yaml
+```
+
+
+# Original GPT4All Model (based on GPL Licensed LLaMa)
 
 
 
@@ -113,8 +198,8 @@ Feel free to convert this to a more structured table.
 
 # Roadmap
 ## Short Term
- - <span style="color:green">(IN PROGRESS)</span> Train a GPT4All model based on GPTJ to alleviate llama distribution issues.
- - <span style="color:green">(IN PROGRESS)</span> Create improved CPU and GPU interfaces for this model.
+ - <span style="color:green">(Done)</span> Train a GPT4All model based on GPTJ to alleviate llama distribution issues.
+ - <span style="color:green">(Done)</span> Create improved CPU and GPU interfaces for this model.
  - <span style="color:green">(Done)</span> [Integrate llama.cpp bindings](https://github.com/nomic-ai/pyllamacpp)
  - <span style="color:green">(Done)</span> [Create a good conversational chat interface for the model.](https://github.com/nomic-ai/gpt4all-ui)
  - <span style="color:green">(Done)</span> [Allow users to opt in and submit their chats for subsequent training runs](https://github.com/nomic-ai/gpt4all-ui)
@@ -122,7 +207,7 @@ Feel free to convert this to a more structured table.
 ## Medium Term
  - <span style="color:red">(NOT STARTED)</span> Integrate GPT4All with [Atlas](https://atlas.nomic.ai) to allow for document retrieval.
    - BLOCKED by GPT4All based on GPTJ
- - <span style="color:red">(NOT STARTED)</span> Integrate GPT4All with Langchain.
+ - <span style="color:red">(Done)</span> Integrate GPT4All with Langchain.
  - <span style="color:green">(IN PROGRESS)</span> Build easy custom training scripts to allow users to fine tune models.
 
 ## Long Term
@@ -131,15 +216,20 @@ Feel free to convert this to a more structured table.
 
 # Reproducibility
 
-Trained LoRa Weights:
+Trained Model Weights:
 - gpt4all-lora (four full epochs of training):  https://huggingface.co/nomic-ai/gpt4all-lora
 - gpt4all-lora-epoch-2 (three full epochs of training) https://huggingface.co/nomic-ai/gpt4all-lora-epoch-2
+- gpt4all-j (one full epoch of training) (https://huggingface.co/nomic-ai/gpt4all-j)
+- gpt4all-j-lora (one full epoch of training) (https://huggingface.co/nomic-ai/gpt4all-j-lora)
 
 Raw Data:
 - [Training Data Without P3](https://huggingface.co/datasets/nomic-ai/gpt4all_prompt_generations)
   - Explorer: https://atlas.nomic.ai/map/gpt4all_data_clean_without_p3
 - [Full Dataset with P3](https://huggingface.co/datasets/nomic-ai/gpt4all_prompt_generations_with_p3)
   - Explorer: https://atlas.nomic.ai/map/gpt4all_data_clean
+- [GPT4All-J Dataset](https://huggingface.co/datasets/nomic-ai/gpt4all-j-prompt-generations)
+   -  Explorer Indexed on Prompts: https://atlas.nomic.ai/map/gpt4all-j-prompts-curated
+   -  Exporer Indexed on Responses: https://atlas.nomic.ai/map/gpt4all-j-response-curated
 
 We are not distributing a LLaMa 7B checkpoint.
 
@@ -159,9 +249,6 @@ Setup the environment
 ```
 python -m pip install -r requirements.txt
 
-cd transformers
-pip install -e . 
-
 cd ../peft
 pip install -e .
 ```
@@ -180,7 +267,7 @@ python generate.py --config configs/generate/generate.yaml --prompt "Write a scr
 
 ## Need Help?
 
-Join the <a href="https://discord.gg/kvmy6dQB"> Discord </a> and ask for help in `#gpt4all-help`
+Join the <a href="https://discord.gg/E7q6fp9bmx"> Discord </a> and ask for help in `#gpt4all-help`
 
 # Sample Generations
 
