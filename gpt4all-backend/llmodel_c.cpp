@@ -1,79 +1,69 @@
 #include "llmodel_c.h"
+#include "llmodel.h"
 
-#include "gptj.h"
-#include "llamamodel.h"
-#include "mpt.h"
+#include <cstring>
+#include <cerrno>
+#include <utility>
+
 
 struct LLModelWrapper {
     LLModel *llModel = nullptr;
     LLModel::PromptContext promptContext;
+    ~LLModelWrapper() { delete llModel; }
 };
 
-llmodel_model llmodel_gptj_create()
-{
-    LLModelWrapper *wrapper = new LLModelWrapper;
-    wrapper->llModel = new GPTJ;
-    return reinterpret_cast<void*>(wrapper);
-}
 
-void llmodel_gptj_destroy(llmodel_model gptj)
-{
-    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(gptj);
-    delete wrapper->llModel;
-    delete wrapper;
-}
+thread_local static std::string last_error_message;
 
-llmodel_model llmodel_mpt_create()
-{
-    LLModelWrapper *wrapper = new LLModelWrapper;
-    wrapper->llModel = new MPT;
-    return reinterpret_cast<void*>(wrapper);
-}
-
-void llmodel_mpt_destroy(llmodel_model mpt)
-{
-    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(mpt);
-    delete wrapper->llModel;
-    delete wrapper;
-}
-
-llmodel_model llmodel_llama_create()
-{
-    LLModelWrapper *wrapper = new LLModelWrapper;
-    wrapper->llModel = new LLamaModel;
-    return reinterpret_cast<void*>(wrapper);
-}
-
-void llmodel_llama_destroy(llmodel_model llama)
-{
-    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(llama);
-    delete wrapper->llModel;
-    delete wrapper;
-}
 
 llmodel_model llmodel_model_create(const char *model_path) {
+    auto fres = llmodel_model_create2(model_path, "auto", nullptr);
+    if (!fres) {
+        fprintf(stderr, "Invalid model file\n");
+    }
+    return fres;
+}
 
-    uint32_t magic;
-    llmodel_model model;
-    FILE *f = fopen(model_path, "rb");
-    fread(&magic, sizeof(magic), 1, f);
+llmodel_model llmodel_model_create2(const char *model_path, const char *build_variant, llmodel_error *error) {
+    auto wrapper = new LLModelWrapper;
+    int error_code = 0;
 
-    if (magic == 0x67676d6c) { model = llmodel_gptj_create();  }
-    else if (magic == 0x67676a74) { model = llmodel_llama_create(); }
-    else if (magic == 0x67676d6d) { model = llmodel_mpt_create();   }
-    else  {fprintf(stderr, "Invalid model file\n");}
-    fclose(f);
-    return model;
+    try {
+        wrapper->llModel = LLModel::construct(model_path, build_variant);
+    } catch (const std::exception& e) {
+        error_code = EINVAL;
+        last_error_message = e.what();
+    }
+
+    if (!wrapper->llModel) {
+        delete std::exchange(wrapper, nullptr);
+        // Get errno and error message if none
+        if (error_code == 0) {
+            if (errno != 0) {
+                error_code = errno;
+                last_error_message = std::strerror(error_code);
+            } else {
+                error_code = ENOTSUP;
+                last_error_message = "Model format not supported (no matching implementation found)";
+            }
+        }
+        // Set error argument
+        if (error) {
+            error->message = last_error_message.c_str();
+            error->code = error_code;
+        }
+    }
+    return reinterpret_cast<llmodel_model*>(wrapper);
 }
 
 void llmodel_model_destroy(llmodel_model model) {
+    delete reinterpret_cast<LLModelWrapper*>(model);
+}
 
+size_t llmodel_required_mem(llmodel_model model, const char *model_path)
+{
     LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(model);
-    const std::type_info &modelTypeInfo = typeid(*wrapper->llModel);
-
-    if (modelTypeInfo == typeid(GPTJ))       { llmodel_gptj_destroy(model);  }
-    if (modelTypeInfo == typeid(LLamaModel)) { llmodel_llama_destroy(model); }
-    if (modelTypeInfo == typeid(MPT))        { llmodel_mpt_destroy(model);   }
+    return wrapper->llModel->requiredMem(model_path);
 }
 
 bool llmodel_loadModel(llmodel_model model, const char *model_path)
@@ -84,20 +74,20 @@ bool llmodel_loadModel(llmodel_model model, const char *model_path)
 
 bool llmodel_isModelLoaded(llmodel_model model)
 {
-    const auto *llm = reinterpret_cast<LLModelWrapper*>(model)->llModel;
-    return llm->isModelLoaded();
+    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(model);
+    return wrapper->llModel->isModelLoaded();
 }
 
 uint64_t llmodel_get_state_size(llmodel_model model)
 {
-    const auto *llm = reinterpret_cast<LLModelWrapper*>(model)->llModel;
-    return llm->stateSize();
+    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(model);
+    return wrapper->llModel->stateSize();
 }
 
 uint64_t llmodel_save_state_data(llmodel_model model, uint8_t *dest)
 {
-    const auto *llm = reinterpret_cast<LLModelWrapper*>(model)->llModel;
-    return llm->saveState(dest);
+    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(model);
+    return wrapper->llModel->saveState(dest);
 }
 
 uint64_t llmodel_restore_state_data(llmodel_model model, const uint8_t *src)
@@ -137,6 +127,9 @@ void llmodel_prompt(llmodel_model model, const char *prompt,
         std::bind(&response_wrapper, std::placeholders::_1, std::placeholders::_2, reinterpret_cast<void*>(response_callback));
     std::function<bool(bool)> recalc_func =
         std::bind(&recalculate_wrapper, std::placeholders::_1, reinterpret_cast<void*>(recalculate_callback));
+
+    if (size_t(ctx->n_past) < wrapper->promptContext.tokens.size())
+        wrapper->promptContext.tokens.resize(ctx->n_past);
 
     // Copy the C prompt context
     wrapper->promptContext.n_past = ctx->n_past;
@@ -181,6 +174,16 @@ void llmodel_setThreadCount(llmodel_model model, int32_t n_threads)
 
 int32_t llmodel_threadCount(llmodel_model model)
 {
-    const auto *llm = reinterpret_cast<LLModelWrapper*>(model)->llModel;
-    return llm->threadCount();
+    LLModelWrapper *wrapper = reinterpret_cast<LLModelWrapper*>(model);
+    return wrapper->llModel->threadCount();
+}
+
+void llmodel_set_implementation_search_path(const char *path)
+{
+    LLModel::setImplementationsSearchPath(path);
+}
+
+const char *llmodel_get_implementation_search_path()
+{
+    return LLModel::implementationsSearchPath().c_str();
 }

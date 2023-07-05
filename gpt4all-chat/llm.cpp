@@ -1,6 +1,6 @@
 #include "llm.h"
-#include "config.h"
-#include "download.h"
+#include "../gpt4all-backend/sysinfo.h"
+#include "../gpt4all-backend/llmodel.h"
 #include "network.h"
 
 #include <QCoreApplication>
@@ -8,7 +8,6 @@
 #include <QFile>
 #include <QProcess>
 #include <QResource>
-#include <QSettings>
 #include <fstream>
 
 class MyLLM: public LLM { };
@@ -20,25 +19,36 @@ LLM *LLM::globalInstance()
 
 LLM::LLM()
     : QObject{nullptr}
-    , m_chatListModel(new ChatListModel(this))
-    , m_threadCount(std::min(4, (int32_t) std::thread::hardware_concurrency()))
-    , m_serverEnabled(false)
     , m_compatHardware(true)
 {
-    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
-        this, &LLM::aboutToQuit);
-    connect(this, &LLM::serverEnabledChanged,
-        m_chatListModel, &ChatListModel::handleServerEnabledChanged);
-
-#if defined(__x86_64__) || defined(__i386__)
-    if (QString(GPT4ALL_AVX_ONLY) == "OFF") {
-        const bool avx(__builtin_cpu_supports("avx"));
-        const bool avx2(__builtin_cpu_supports("avx2"));
-        const bool fma(__builtin_cpu_supports("fma"));
-        m_compatHardware = avx && avx2 && fma;
-        emit compatHardwareChanged();
-    }
+    QString llmodelSearchPaths = QCoreApplication::applicationDirPath();
+    const QString libDir = QCoreApplication::applicationDirPath() + "/../lib/";
+    if (directoryExists(libDir))
+        llmodelSearchPaths += ";" + libDir;
+#if defined(Q_OS_MAC)
+    const QString binDir = QCoreApplication::applicationDirPath() + "/../../../";
+    if (directoryExists(binDir))
+        llmodelSearchPaths += ";" + binDir;
+    const QString frameworksDir = QCoreApplication::applicationDirPath() + "/../Frameworks/";
+    if (directoryExists(frameworksDir))
+        llmodelSearchPaths += ";" + frameworksDir;
 #endif
+    LLModel::setImplementationsSearchPath(llmodelSearchPaths.toStdString());
+
+#if defined(__x86_64__)
+    #ifndef _MSC_VER
+        const bool minimal(__builtin_cpu_supports("avx"));
+    #else
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 1);
+        const bool minimal(cpuInfo[2] & (1 << 28));
+    #endif
+#else
+    const bool minimal = true; // Don't know how to handle non-x86_64
+#endif
+
+    m_compatHardware = minimal;
+    emit compatHardwareChanged();
 }
 
 bool LLM::checkForUpdates() const
@@ -63,33 +73,28 @@ bool LLM::checkForUpdates() const
     return QProcess::startDetached(fileName);
 }
 
-int32_t LLM::threadCount() const
+bool LLM::directoryExists(const QString &path) const
 {
-    return m_threadCount;
+    const QUrl url(path);
+    const QString localFilePath = url.isLocalFile() ? url.toLocalFile() : path;
+    const QFileInfo info(localFilePath);
+    return info.exists() && info.isDir();
 }
 
-void LLM::setThreadCount(int32_t n_threads)
+bool LLM::fileExists(const QString &path) const
 {
-    if (n_threads <= 0)
-        n_threads = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    m_threadCount = n_threads;
-    emit threadCountChanged();
+    const QUrl url(path);
+    const QString localFilePath = url.isLocalFile() ? url.toLocalFile() : path;
+    const QFileInfo info(localFilePath);
+    return info.exists() && info.isFile();
 }
 
-bool LLM::serverEnabled() const
+qint64 LLM::systemTotalRAMInGB() const
 {
-    return m_serverEnabled;
+    return getSystemTotalRAMInGB();
 }
 
-void LLM::setServerEnabled(bool enabled)
+QString LLM::systemTotalRAMInGBString() const
 {
-    if (m_serverEnabled == enabled)
-        return;
-    m_serverEnabled = enabled;
-    emit serverEnabledChanged();
-}
-
-void LLM::aboutToQuit()
-{
-    m_chatListModel->saveChats();
+    return QString::fromStdString(getSystemTotalRAMInGBString());
 }

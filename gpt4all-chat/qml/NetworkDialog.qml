@@ -6,6 +6,7 @@ import QtQuick.Layouts
 import download
 import network
 import llm
+import mysettings
 
 Dialog {
     id: networkDialog
@@ -16,16 +17,6 @@ Dialog {
 
     Theme {
         id: theme
-    }
-
-    Settings {
-        id: settings
-        category: "network"
-        property string attribution: ""
-    }
-
-    Component.onDestruction: {
-        settings.sync()
     }
 
     Column {
@@ -86,7 +77,7 @@ NOTE: By turning on this feature, you will be sending your data to the GPT4All O
             color: theme.textColor
             padding: 20
             width: parent.width
-            text: settings.attribution
+            text: MySettings.networkAttribution
             font.pixelSize: theme.fontSizeLarge
             placeholderText: qsTr("Please provide a name for attribution (optional)")
             placeholderTextColor: theme.backgroundLightest
@@ -98,8 +89,7 @@ NOTE: By turning on this feature, you will be sending your data to the GPT4All O
             Accessible.name: qsTr("Attribution (optional)")
             Accessible.description: qsTr("Textfield for providing attribution")
             onEditingFinished: {
-                settings.attribution = attribution.text;
-                settings.sync();
+                MySettings.networkAttribution = attribution.text;
             }
         }
     }
@@ -117,40 +107,14 @@ NOTE: By turning on this feature, you will be sending your data to the GPT4All O
         padding: 20
         alignment: Qt.AlignRight
         spacing: 10
-        Button {
-            contentItem: Text {
-                color: theme.textColor
-                text: qsTr("Enable")
-            }
-            background: Rectangle {
-                border.color: theme.backgroundLightest
-                border.width: 1
-                radius: 10
-                color: theme.backgroundLight
-            }
-            Accessible.role: Accessible.Button
-            Accessible.name: text
+        MyButton {
+            text: qsTr("Enable")
             Accessible.description: qsTr("Enable opt-in button")
-
-            padding: 15
             DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
         }
-        Button {
-            contentItem: Text {
-                color: theme.textColor
-                text: qsTr("Cancel")
-            }
-            background: Rectangle {
-                border.color: theme.backgroundLightest
-                border.width: 1
-                radius: 10
-                color: theme.backgroundLight
-            }
-            Accessible.role: Accessible.Button
-            Accessible.name: text
+        MyButton {
+            text: qsTr("Cancel")
             Accessible.description: qsTr("Cancel opt-in button")
-
-            padding: 15
             DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
         }
         background: Rectangle {
@@ -159,16 +123,16 @@ NOTE: By turning on this feature, you will be sending your data to the GPT4All O
     }
 
     onAccepted: {
-        if (Network.isActive)
+        if (MySettings.networkIsActive)
             return
-        Network.isActive = true;
+        MySettings.networkIsActive = true;
         Network.sendNetworkToggled(true);
     }
 
     onRejected: {
-        if (!Network.isActive)
+        if (!MySettings.networkIsActive)
             return
-        Network.isActive = false;
+        MySettings.networkIsActive = false;
         Network.sendNetworkToggled(false);
     }
 }

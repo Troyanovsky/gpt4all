@@ -1,9 +1,11 @@
-#include "mpt.h"
-#include "llama.cpp/ggml.h"
+#define MPT_H_I_KNOW_WHAT_I_AM_DOING_WHEN_INCLUDING_THIS_FILE
+#include "mpt_impl.h"
 
 #include "utils.h"
+#include "llmodel_shared.h"
 
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -28,8 +30,12 @@
 #include <thread>
 #include <unordered_set>
 #include <regex>
+#include <ggml.h>
 
-static const size_t MB = 1024*1024;
+
+namespace {
+const char *modelType_ = "MPT";
+}
 
 // default hparams (MPT 7B)
 struct mpt_hparams {
@@ -58,39 +64,6 @@ struct mpt_layer {
     struct ggml_tensor * ffn_down_proj_w;
 };
 
-struct mpt_buffer {
-    uint8_t * addr = NULL;
-    size_t size = 0;
-
-    void resize(size_t size) {
-        delete[] addr;
-        addr = new uint8_t[size];
-        this->size = size;
-    }
-
-    ~mpt_buffer() {
-        fflush(stdout);
-        delete[] addr;
-    }
-};
-
-struct mpt_kv_cache {
-    struct ggml_tensor * k;
-    struct ggml_tensor * v;
-
-    struct ggml_context * ctx = NULL;
-
-    mpt_buffer buf;
-
-    int n; // number of tokens currently in the cache
-
-    ~mpt_kv_cache() {
-        if (ctx) {
-            ggml_free(ctx);
-        }
-    }
-};
-
 struct mpt_model {
     mpt_hparams hparams;
 
@@ -103,12 +76,14 @@ struct mpt_model {
 
     std::vector<mpt_layer> layers;
 
-    struct mpt_kv_cache kv_self;
+    struct llm_kv_cache kv_self;
     struct ggml_context * ctx;
     std::map<std::string, struct ggml_tensor *> tensors;
 
 
-    mpt_buffer buf;
+    llm_buffer eval_buf;
+    llm_buffer scr0_buf;
+    llm_buffer scr1_buf;
 
     ~mpt_model() {
         if (ctx) {
@@ -119,7 +94,7 @@ struct mpt_model {
 
 static bool kv_cache_init(
         const struct mpt_hparams & hparams,
-             struct mpt_kv_cache & cache,
+             struct llm_kv_cache & cache,
                          ggml_type   wtype,
                                int   n_ctx) {
     const int n_embd  = hparams.n_embd;
@@ -128,7 +103,7 @@ static bool kv_cache_init(
     const int64_t n_mem      = (int64_t)n_layer*n_ctx;
     const int64_t n_elements = n_embd*n_mem;
 
-    cache.buf.resize(2u*n_elements*ggml_type_size(wtype) + 2u*MB);
+    cache.buf.resize(2u*n_elements*ggml_type_size(wtype) + 2_MiB);
 
     struct ggml_init_params params;
     params.mem_size   = cache.buf.size;
@@ -148,9 +123,13 @@ static bool kv_cache_init(
     return true;
 }
 
-// load the model's weights from a stream
-bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & model, gpt_vocab & vocab) {
+// load the model's weights from a stream. if mem_req ptr is passed the model is
+// only partially parsed to estimate required memory
+bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & model, gpt_vocab & vocab, size_t * mem_req) {
     printf("%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
+    if (mem_req != nullptr) {
+        *mem_req = 0;
+    }
 
     // verify magic
     {
@@ -272,6 +251,18 @@ bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & mod
         printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
     }
 
+    if (mem_req != nullptr) {
+        *mem_req += ctx_size;
+        const int n_embd  = model.hparams.n_embd;
+        const int n_layer = model.hparams.n_layer;
+
+        const int64_t n_mem      = (int64_t)n_layer*model.hparams.n_ctx;
+        const int64_t n_elements = n_embd*n_mem;
+
+        *mem_req += (2u*n_elements*ggml_type_size(wtype) + 2_MiB);
+        return false;
+    }
+
     // create the ggml context
     {
         struct ggml_init_params params = {
@@ -293,7 +284,6 @@ bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & mod
 
         const int n_embd  = hparams.n_embd;
         const int n_layer = hparams.n_layer;
-        const int n_ctx   = hparams.n_ctx;
         const int n_vocab = hparams.n_vocab;
         const int expand  = hparams.expand;
 
@@ -331,14 +321,6 @@ bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & mod
     // key + value memory
     {
         const auto & hparams = model.hparams;
-
-        const int n_embd  = hparams.n_embd;
-        const int n_layer = hparams.n_layer;
-        const int n_ctx   = hparams.n_ctx;
-
-        const int n_mem      = n_layer*n_ctx;
-        const int n_elements = n_embd*n_mem;
-
         if (!kv_cache_init(hparams, model.kv_self, GGML_TYPE_F16, model.hparams.n_ctx)) {
             fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
             ggml_free(ctx);
@@ -391,8 +373,8 @@ bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & mod
             }
 
             if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1]) {
-                fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%d, %d], expected [%d, %d]\n",
-                        __func__, name.data(), (int) tensor->ne[0], (int) tensor->ne[1], ne[0], ne[1]);
+                fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%" PRId64 ", %" PRId64 "], expected [%d, %d]\n",
+                        __func__, name.data(), tensor->ne[0], tensor->ne[1], ne[0], ne[1]);
                 return false;
             }
 
@@ -424,6 +406,9 @@ bool mpt_model_load(const std::string &fname, std::istream &fin, mpt_model & mod
         printf("%s: model size = %8.2f MB / num tensors = %d\n", __func__, total_size/1024.0/1024.0, n_tensors);
     }
 
+    model.scr0_buf.resize(256u * 1024 * 1024);
+    model.scr1_buf.resize(256u * 1024 * 1024);
+
     return true;
 }
 
@@ -436,7 +421,7 @@ bool mpt_model_load(const std::string & fname, mpt_model & model, gpt_vocab & vo
         return false;
     }
 
-    bool loaded = mpt_model_load(fname, fin, model, vocab);
+    bool loaded = mpt_model_load(fname, fin, model, vocab, nullptr);
     fin.close();
     return loaded;
 }
@@ -457,33 +442,32 @@ bool mpt_eval(
     const int n_ctx   = hparams.n_ctx;
     const int n_head  = hparams.n_head;
     const int n_vocab = hparams.n_vocab;
-    const int expand  = hparams.expand;
 
-    const int d_key = n_embd/n_head;
+    const size_t init_buf_size = 1024_MiB;
+    if (!model.eval_buf.addr || model.eval_buf.size < init_buf_size)
+        model.eval_buf.resize(init_buf_size);
 
-    const size_t init_buf_size = 1024u*MB;
-    if (!model.buf.addr || model.buf.size < init_buf_size)
-        model.buf.resize(init_buf_size);
-
-    if (mem_per_token > 0 && mem_per_token*N > model.buf.size) {
+    if (mem_per_token > 0 && mem_per_token*N > model.eval_buf.size) {
         const size_t buf_size_new = 1.1*(mem_per_token*N); // add 10% to account for ggml object overhead
         // printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, model.buf.size, buf_size_new);
 
         // reallocate
-        model.buf.resize(buf_size_new);
-        if (model.buf.addr == nullptr) {
-            fprintf(stderr, "%s: failed to allocate %zu bytes\n", __func__, model.buf.size);
+        model.eval_buf.resize(buf_size_new);
+        if (model.eval_buf.addr == nullptr) {
+            fprintf(stderr, "%s: failed to allocate %zu bytes\n", __func__, model.eval_buf.size);
             return false;
         }
     }
 
     struct ggml_init_params params = {
-        .mem_size   = model.buf.size,
-        .mem_buffer = model.buf.addr,
+        .mem_size   = model.eval_buf.size,
+        .mem_buffer = model.eval_buf.addr,
+        .no_alloc = false
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph gf = { .n_threads = n_threads };
+    struct ggml_cgraph gf = {};
+    gf.n_threads = n_threads;
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     memcpy(embd->data, embd_inp.data(), N*ggml_element_size(embd));
@@ -492,6 +476,7 @@ bool mpt_eval(
     struct ggml_tensor * inpL = ggml_get_rows(ctx0, model.wte, embd);
 
     for (int il = 0; il < n_layer; ++il) {
+        ggml_set_scratch(ctx0, {0, model.scr0_buf.size, model.scr0_buf.addr, });
 
         struct ggml_tensor * inpSA = inpL;
         struct ggml_tensor * cur = inpSA;
@@ -583,7 +568,7 @@ bool mpt_eval(
                     cur);
         }
 
-
+        ggml_set_scratch(ctx0, {0, model.scr1_buf.size, model.scr1_buf.addr, });
         // residual
         struct ggml_tensor * resSA = ggml_add(ctx0, cur, inpSA);
         // feed-forward network
@@ -608,6 +593,7 @@ bool mpt_eval(
         // self-attention + FF
         inpL = ggml_add(ctx0, cur, resSA);
     }
+    ggml_set_scratch(ctx0, {0, model.scr0_buf.size, model.scr0_buf.addr, });
 
     struct ggml_tensor * out = inpL;
     // -> logits
@@ -616,6 +602,7 @@ bool mpt_eval(
         out = ggml_mul(ctx0,
                     ggml_repeat(ctx0, model.norm_f_w, out),
                     out);
+        ggml_set_scratch(ctx0, { 0, 0, nullptr, });
         out = ggml_mul_mat(ctx0, model.wte, out);
     }
 
@@ -695,8 +682,7 @@ size_t mpt_copy_state_data(const mpt_model &model, const std::mt19937 &rng, uint
     }
 
     const size_t written  = out - dest;
-    const size_t expected = mpt_get_state_size(model);
-    assert(written == expected);
+    assert(written == mpt_get_state_size(model));
     fflush(stdout);
     return written;
 }
@@ -745,8 +731,7 @@ size_t mpt_set_state_data(mpt_model *model, std::mt19937 *rng, const uint8_t *sr
     }
 
     const size_t nread    = in - src;
-    const size_t expected = mpt_get_state_size(*model);
-    assert(nread == expected);
+    assert(nread == mpt_get_state_size(*model));
     fflush(stdout);
     return nread;
 }
@@ -764,9 +749,18 @@ struct MPTPrivate {
 
 MPT::MPT()
     : d_ptr(new MPTPrivate) {
-
     d_ptr->model = new mpt_model;
+    d_ptr->model->ctx = nullptr;
     d_ptr->modelLoaded = false;
+}
+
+size_t MPT::requiredMem(const std::string &modelPath) {
+    mpt_model dummy_model;
+    gpt_vocab dummy_vocab;
+    size_t mem_req;
+    auto fin = std::ifstream(modelPath, std::ios::binary);
+    mpt_model_load(modelPath, fin, dummy_model, dummy_vocab, &mem_req);
+    return mem_req;
 }
 
 bool MPT::loadModel(const std::string &modelPath) {
@@ -776,8 +770,8 @@ bool MPT::loadModel(const std::string &modelPath) {
     auto fin = std::ifstream(modelPath, std::ios::binary);
 
     // load the model
-    if (!mpt_model_load(modelPath, fin, *d_ptr->model, d_ptr->vocab)) {
-        std::cerr << "GPT-J ERROR: failed to load model from " <<  modelPath;
+    if (!mpt_model_load(modelPath, fin, *d_ptr->model, d_ptr->vocab, nullptr)) {
+        std::cerr << "MPT ERROR: failed to load model from " <<  modelPath;
         return false;
     }
 
@@ -822,222 +816,78 @@ size_t MPT::restoreState(const uint8_t *src)
     return mpt_set_state_data(d_ptr->model, &d_ptr->rng, src);
 }
 
-void MPT::prompt(const std::string &prompt,
-        std::function<bool(int32_t)> promptCallback,
-        std::function<bool(int32_t, const std::string&)> responseCallback,
-        std::function<bool(bool)> recalculateCallback,
-        PromptContext &promptCtx) {
+std::vector<LLModel::Token> MPT::tokenize(PromptContext &, const std::string &str) const
+{
+    return ::gpt_tokenize(d_ptr->vocab, str);
+}
 
-    if (!isModelLoaded()) {
-        std::cerr << "GPT-J ERROR: prompt won't work with an unloaded model!\n";
-        return;
-    }
+std::string MPT::tokenToString(Token id) const
+{
+    return d_ptr->vocab.id_to_token[id];
+}
 
-    const int64_t t_main_start_us = ggml_time_us();
+LLModel::Token MPT::sampleToken(PromptContext &promptCtx) const
+{
+    const size_t n_prev_toks = std::min((size_t) promptCtx.repeat_last_n, promptCtx.tokens.size());
+    return gpt_sample_top_k_top_p(d_ptr->model->hparams.n_vocab,
+        promptCtx.tokens.data() + promptCtx.tokens.size() - n_prev_toks,
+        n_prev_toks,
+        promptCtx.logits,
+        promptCtx.top_k, promptCtx.top_p, promptCtx.temp,
+        promptCtx.repeat_penalty,
+        d_ptr->rng);
+}
 
-    int64_t t_sample_us  = 0;
-    int64_t t_predict_us = 0;
-    int64_t t_prompt_us = 0;
-
-    // tokenize the prompt
-    std::vector<int> embd_inp = gpt_tokenize(d_ptr->vocab, prompt);
-
-    // save the context size
-    promptCtx.n_ctx = d_ptr->model->hparams.n_ctx;
-
-    if ((int) embd_inp.size() > promptCtx.n_ctx - 4) {
-        responseCallback(-1, "ERROR: The prompt size exceeds the context window size and cannot be processed.");
-        std::cerr << "GPT-J ERROR: The prompt is" << embd_inp.size() <<
-            "tokens and the context window is" << promptCtx.n_ctx << "!\n";
-        return;
-    }
-
-    promptCtx.n_predict = std::min(promptCtx.n_predict, promptCtx.n_ctx - (int) embd_inp.size());
-    promptCtx.n_past = std::min(promptCtx.n_past, promptCtx.n_ctx);
-
+bool MPT::evalTokens(PromptContext &ctx, const std::vector<int32_t> &tokens) const
+{
     // determine the required inference memory per token:
     static bool initialized = false;
-    static std::vector<int> p_instruct;
-    static std::vector<int> r_instruct;
     if (!initialized) {
-         mpt_eval(*d_ptr->model, d_ptr->n_threads, 0, { 0, 1, 2, 3 }, promptCtx.logits,
+        mpt_eval(*d_ptr->model, d_ptr->n_threads, 0, { 0, 1, 2, 3 }, ctx.logits,
             d_ptr->mem_per_token);
         initialized = true;
     }
 
-    // process the prompt in batches
-    size_t i = 0;
-    const int64_t t_start_prompt_us = ggml_time_us();
-    while (i < embd_inp.size()) {
-        size_t batch_end = std::min(i + promptCtx.n_batch, embd_inp.size());
-        std::vector<int> batch(embd_inp.begin() + i, embd_inp.begin() + batch_end);
-
-        // Check if the context has run out...
-        if (promptCtx.n_past + batch.size() > promptCtx.n_ctx) {
-            const int32_t erasePoint = promptCtx.n_ctx * promptCtx.contextErase;
-            // Erase the first percentage of context from the tokens...
-            std::cerr << "MPT: reached the end of the context window so resizing\n";
-            promptCtx.tokens.erase(promptCtx.tokens.begin(), promptCtx.tokens.begin() + erasePoint);
-            promptCtx.n_past = promptCtx.tokens.size();
-            recalculateContext(promptCtx, recalculateCallback);
-            assert(promptCtx.n_past + batch.size() <= promptCtx.n_ctx);
-        }
-
-        if (!mpt_eval(*d_ptr->model, d_ptr->n_threads, promptCtx.n_past, batch, promptCtx.logits,
-            d_ptr->mem_per_token)) {
-            std::cerr << "GPT-J ERROR: Failed to process prompt\n";
-            return;
-        }
-
-        size_t tokens = batch_end - i;
-        for (size_t t = 0; t < tokens; ++t) {
-            if (promptCtx.tokens.size() == promptCtx.n_ctx)
-                promptCtx.tokens.erase(promptCtx.tokens.begin());
-            promptCtx.tokens.push_back(batch.at(t));
-            if (!promptCallback(batch.at(t)))
-                return;
-        }
-        promptCtx.n_past += batch.size();
-        i = batch_end;
-    }
-    t_prompt_us += ggml_time_us() - t_start_prompt_us;
-
-    int p_instructFound = 0;
-    int r_instructFound = 0;
-
-    std::string cachedResponse;
-    std::vector<int> cachedTokens;
-    std::unordered_set<std::string> reversePrompts
-        = { "### Instruction", "### Prompt", "### Response", "### Human", "### Assistant" };
-
-    // predict next tokens
-    int32_t totalPredictions = 0;
-    for (int i = 0; i < promptCtx.n_predict; i++) {
-
-        // sample next token
-        const int n_vocab = d_ptr->model->hparams.n_vocab;
-        int id = 0;
-        {
-            const int64_t t_start_sample_us = ggml_time_us();
-            const size_t n_prev_toks = std::min((size_t) promptCtx.repeat_last_n, promptCtx.tokens.size());
-            id = gpt_sample_top_k_top_p(d_ptr->vocab, n_vocab,
-                promptCtx.tokens.data() + promptCtx.tokens.size() - n_prev_toks,
-                n_prev_toks,
-                promptCtx.logits,
-                promptCtx.top_k, promptCtx.top_p, promptCtx.temp,
-                promptCtx.repeat_penalty,
-                d_ptr->rng);
-
-            t_sample_us += ggml_time_us() - t_start_sample_us;
-        }
-
-        // Check if the context has run out...
-        if (promptCtx.n_past + 1 > promptCtx.n_ctx) {
-            const int32_t erasePoint = promptCtx.n_ctx * promptCtx.contextErase;
-            // Erase the first percentage of context from the tokens...
-            std::cerr << "MPT: reached the end of the context window so resizing\n";
-            promptCtx.tokens.erase(promptCtx.tokens.begin(), promptCtx.tokens.begin() + erasePoint);
-            promptCtx.n_past = promptCtx.tokens.size();
-            recalculateContext(promptCtx, recalculateCallback);
-            assert(promptCtx.n_past + 1 <= promptCtx.n_ctx);
-        }
-
-        const int64_t t_start_predict_us = ggml_time_us();
-        if (!mpt_eval(*d_ptr->model, d_ptr->n_threads, promptCtx.n_past, { id }, promptCtx.logits,
-            d_ptr->mem_per_token)) {
-            std::cerr << "GPT-J ERROR: Failed to predict next token\n";
-            return;
-        }
-        t_predict_us += ggml_time_us() - t_start_predict_us;
-
-        promptCtx.n_past += 1;
-        // display text
-        ++totalPredictions;
-
-        // mpt-7b-chat has special token for end
-        if (d_ptr->has_im_end && id == d_ptr->vocab.token_to_id["<|im_end|>"])
-            goto stop_generating;
-
-        if (id == 0 /*end of text*/)
-            goto stop_generating;
-
-        const std::string str = d_ptr->vocab.id_to_token[id];
-
-        // Check if the provided str is part of our reverse prompts
-        bool foundPartialReversePrompt = false;
-        const std::string completed = cachedResponse + str;
-        if (reversePrompts.find(completed) != reversePrompts.end()) {
-            goto stop_generating;
-        }
-
-        // Check if it partially matches our reverse prompts and if so, cache
-        for (auto s : reversePrompts) {
-            if (s.compare(0, completed.size(), completed) == 0) {
-                foundPartialReversePrompt = true;
-                cachedResponse = completed;
-                break;
-            }
-        }
-
-        // Regardless the token gets added to our cache
-        cachedTokens.push_back(id);
-
-        // Continue if we have found a partial match
-        if (foundPartialReversePrompt)
-            continue;
-
-        // Empty the cache
-        for (auto t : cachedTokens) {
-            if (promptCtx.tokens.size() == promptCtx.n_ctx)
-                promptCtx.tokens.erase(promptCtx.tokens.begin());
-            promptCtx.tokens.push_back(t);
-            if (!responseCallback(t, d_ptr->vocab.id_to_token[t]))
-                goto stop_generating;
-        }
-        cachedTokens.clear();
-    }
-
-stop_generating:
-
-#if 0
-    // report timing
-    {
-        const int64_t t_main_end_us = ggml_time_us();
-
-        std::cout << "GPT-J INFO: mem per token = " << mem_per_token << " bytes\n";
-        std::cout << "GPT-J INFO:   sample time = " << t_sample_us/1000.0f << " ms\n";
-        std::cout << "GPT-J INFO:   prompt time = " << t_prompt_us/1000.0f << " ms\n";
-        std::cout << "GPT-J INFO:  predict time = " << t_predict_us/1000.0f << " ms / " << t_predict_us/1000.0f/totalPredictions << " ms per token\n";
-        std::cout << "GPT-J INFO:    total time = " << (t_main_end_us - t_main_start_us)/1000.0f << " ms\n";
-        fflush(stdout);
-    }
-#endif
-
-    return;
+    return mpt_eval(*d_ptr->model, d_ptr->n_threads, ctx.n_past, tokens, ctx.logits, d_ptr->mem_per_token);
 }
 
-void MPT::recalculateContext(PromptContext &promptCtx, std::function<bool(bool)> recalculate)
+int32_t MPT::contextLength() const
 {
-    size_t i = 0;
-    promptCtx.n_past = 0;
-    while (i < promptCtx.tokens.size()) {
-        size_t batch_end = std::min(i + promptCtx.n_batch, promptCtx.tokens.size());
-        std::vector<int> batch(promptCtx.tokens.begin() + i, promptCtx.tokens.begin() + batch_end);
+    return d_ptr->model->hparams.n_ctx;
+}
 
-        assert(promptCtx.n_past + batch.size() <= promptCtx.n_ctx);
+const std::vector<LLModel::Token> &MPT::endTokens() const
+{
+    static const std::vector<LLModel::Token> fres = {0, d_ptr->vocab.token_to_id["<|im_end|>"]};
+    return fres;
+}
 
-        if (!mpt_eval(*d_ptr->model, d_ptr->n_threads, promptCtx.n_past, batch, promptCtx.logits,
-            d_ptr->mem_per_token)) {
-            std::cerr << "MPT ERROR: Failed to process prompt\n";
-            goto stop_generating;
-        }
-        promptCtx.n_past += batch.size();
-        if (!recalculate(true))
-            goto stop_generating;
-        i = batch_end;
-    }
-    assert(promptCtx.n_past == promptCtx.tokens.size());
+#if defined(_WIN32)
+#define DLL_EXPORT __declspec(dllexport)
+#else
+#define DLL_EXPORT __attribute__ ((visibility ("default")))
+#endif
 
-stop_generating:
-    recalculate(false);
+extern "C" {
+DLL_EXPORT bool is_g4a_backend_model_implementation() {
+    return true;
+}
+
+DLL_EXPORT const char *get_model_type() {
+    return modelType_;
+}
+
+DLL_EXPORT const char *get_build_variant() {
+    return GGML_BUILD_VARIANT;
+}
+
+DLL_EXPORT bool magic_match(std::istream& f) {
+    uint32_t magic = 0;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    return magic == 0x67676d6d;
+}
+
+DLL_EXPORT LLModel *construct() {
+    return new MPT;
+}
 }
